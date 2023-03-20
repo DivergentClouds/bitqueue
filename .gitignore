@@ -1,0 +1,3 @@
+examples/**
+zig-out/**
+zig-cache/**
