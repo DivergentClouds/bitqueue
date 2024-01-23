@@ -30,6 +30,8 @@
   - Enqueue the next 8 bits of input, if no input is available, then nothing is enqueued
 - `.`
   - Dequeue 8 bits and send them to the output
+- `#`
+ 	- Print the queue state as a series of 1s and 0s followed by a newline
 - `;`
   - Start a comment that lasts until the end of the line 
 
@@ -62,28 +64,3 @@
   first. For example, `,.` will output the same byte that was inputted.
 
 - Every `(` must have a matching `)` and vice versa.
-
-## Computational Class
-
-BitQueue is Turing-complete as Bitwise Cyclic Tag can be easily implemented. 
-
-```
-; insert initial data queue state here
-
-'(
-  ; insert series of 'f0', 'f10' and 'f11' functions here.
-  "
-)
-
-:f0( ; 0 in BCT
-  ?()
-)
-
-:f10( ; 10 in BCT
-  ?0
-)
-
-:f11( ; 11 in BCT
-  ?1
-)
-```

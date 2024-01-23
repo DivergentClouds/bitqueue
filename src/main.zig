@@ -1,239 +1,432 @@
 const std = @import("std");
 
-const Command = enum(u8) {
-    one = '1',
-    zero = '0',
-    call = '>',
-    ret = '<',
-    ret_jmp = '^',
-    call_current = '"',
-    define_fn = ':',
-    anon_fn = '\'',
-    conditional = '?',
-    block_start = '(',
-    block_end = ')',
-    input = ',',
-    output = '.',
-    comment = ';',
-};
-
-const Instruction = struct {
-    command: ?Command, // If an identifier is reached, this does not change, only null if error
-    identifier: ?u64, // Hash of identifier name, null if no current identifier
-};
-
-const Identifier = enum {
-    call, // after `>`
-    define, // after `:`
-    none, // otherwise
-};
-
-const Level = enum {
-    conditional,
-    function,
-    block,
-};
-
-const Direction = enum {
-    forward,
-    backward,
-};
-
 pub fn main() !void {
-    const stderr = std.io.getStdErr();
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
-    defer _ = gpa.deinit();
+    defer std.debug.assert(gpa.deinit() == .ok);
 
+    const allocator = gpa.allocator();
+
+    // set up args
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     if (args.len != 2) {
-        try stderr.writeAll("Wrong number of arguments\n\n");
-        try stderr.writeAll("Usage:\nbitqueue <program file>\n");
-        return error.BadArgs;
+        printUsage(args[0], "Wrong number of arguments") catch {};
+        return error.BadArgCount;
     }
 
     const code_file = try std.fs.cwd().openFile(args[1], .{});
     defer code_file.close();
 
-    const code = try code_file.readToEndAlloc(allocator, (try code_file.metadata()).size());
-    defer allocator.free(code);
-
-    try interpret(code, allocator);
+    try interpret(code_file, allocator);
 }
 
-fn interpret(code: []u8, allocator: std.mem.Allocator) !void {
-    const levels = try allocator.alloc(Level, 256);
-    defer allocator.free(levels);
+const Command = enum(u8) {
+    one = '1',
+    zero = '0',
+    call = '>',
+    ret = '<',
+    ret_up = '^',
+    ret_2 = '*',
+    call_current = '"',
+    define = ':',
+    call_anon = '\'',
+    conditional = '?',
+    start_block = '(',
+    end_block = ')',
+    input = ',',
+    output = '.',
+    dump_state = '#',
+    comment = ';',
+    _,
+};
 
-    var depth: usize = 0; // number of levels currently being used
+const Function = struct {
+    /// start of body
+    entry: usize,
+    /// after body
+    exit: usize,
+};
 
-    var line: usize = 1;
-    var column: usize = 0; // incremented on first call of traverseCode()
-    var comment: bool = false;
-    var instruction_address: usize = 0;
+const FunctionCall = struct {
+    function: Function,
+    return_address: usize,
+};
 
-    var instruction: Instruction = Instruction{
-        .command = null,
-        .identifier = null,
-    };
+fn interpret(code_file: std.fs.File, backing_allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    const allocator = arena.allocator();
+    defer arena.deinit();
 
-    var queue_start: usize = 0;
-    var queue_end: usize = 0;
-    var queue_alloc_size: usize = 1024 * 8; // 1 KiB of bits
-
-    var queue = try std.DynamicBitSet.initFull(allocator, queue_alloc_size);
+    var queue = std.ArrayList(u1).init(allocator);
     defer queue.deinit();
 
-    var running = true;
+    var call_stack = std.ArrayList(FunctionCall).init(allocator);
+    defer call_stack.deinit();
 
-    while (running) {
-        instruction = traverseCode(code, &instruction_address, instruction, &line, &column, .forward, &comment, allocator) orelse return;
-        switch (instruction.command orelse {
-            try printError(error.UnexpectedIdentifier, line, column, null); // TODO: Make print interned identifier name
-            return;
-        }) {
+    var anon_function_map = std.AutoHashMap(
+        usize,
+        Function,
+    ).init(allocator);
+    defer anon_function_map.deinit();
+
+    var named_function_map = std.StringHashMap(Function).init(allocator);
+    defer named_function_map.deinit();
+
+    try parseNamedFunctions(
+        code_file,
+        &named_function_map,
+        allocator,
+    );
+
+    try parseAnonFunctions(
+        code_file,
+        &anon_function_map,
+    );
+
+    const stdout = std.io.getStdOut().writer();
+
+    const code_reader = code_file.reader().any();
+    while (readByteNoWhitespace(code_reader)) |byte| {
+        const command: Command = @enumFromInt(byte);
+
+        if (call_stack.getLastOrNull()) |current_function| {
+            const exit_address = current_function.function.exit;
+            if (try code_file.getPos() >= exit_address) {
+                try returnFromFunction(code_file, &call_stack);
+            }
+        }
+
+        switch (command) {
             .one => {
-                try enqueue(&queue, &queue_end, 1, &queue_alloc_size);
+                try queue.append(1);
             },
             .zero => {
-                try enqueue(&queue, &queue_end, 0, &queue_alloc_size);
+                try queue.append(0);
             },
             .call => {
-                try addLevel(levels, &depth, .function, allocator);
+                const function_name = try readFunctionName(code_file, backing_allocator);
+                defer backing_allocator.free(function_name);
+
+                const function = named_function_map.get(function_name) orelse
+                    return error.AttemptToCallUndefinedFunction;
+
+                try call_stack.append(FunctionCall{
+                    .function = function,
+                    .return_address = try code_file.getPos(),
+                });
+
+                try code_file.seekTo(function.entry);
             },
-            .ret => {},
-            .ret_jmp => {},
-            .call_current => {},
-            .define_fn => {},
-            .anon_fn => {},
-            .conditional => {},
-            .block_start => {},
-            .block_end => {},
-            .input => {},
-            .output => {},
-            .comment => {
-                comment = true;
+            .ret => {
+                try returnFromFunction(code_file, &call_stack);
+            },
+            .ret_up => {
+                try returnFromFunction(code_file, &call_stack);
+
+                const start = if (call_stack.getLastOrNull()) |current_function|
+                    current_function.function.entry
+                else
+                    0;
+
+                try code_file.seekTo(start);
+            },
+            .ret_2 => {
+                _ = call_stack.popOrNull();
+                try returnFromFunction(code_file, &call_stack);
+            },
+            .call_current => {
+                // TODO: add tailcall optimization?
+                const current_function_call = call_stack.getLastOrNull() orelse
+                    return error.AttemptToCallFileAsFunction;
+
+                try call_stack.append(FunctionCall{
+                    .function = current_function_call.function,
+                    .return_address = try code_file.getPos() + 1,
+                });
+
+                try code_file.seekTo(current_function_call.function.entry);
+            },
+            .define => {
+                try skipFunctionName(code_file);
+                try skipBody(code_file);
+            },
+            .call_anon => {
+                const anon_function = anon_function_map.get(try code_file.getPos()).?;
+                try call_stack.append(FunctionCall{
+                    .function = anon_function,
+                    .return_address = anon_function.exit,
+                });
+            },
+            .conditional => {
+                if (queue.items.len == 0) {
+                    return;
+                }
+                if (queue.orderedRemove(0) == 0) {
+                    try skipBody(code_file);
+                }
+            },
+            .start_block, .end_block => {},
+            .input => {
+                const stdin = std.io.getStdIn().reader();
+                var input_byte: u8 = stdin.readByte() catch continue;
+                var bit: u1 = undefined;
+
+                for (0..8) |_| {
+                    input_byte, bit = @shlWithOverflow(input_byte, @as(u3, @intCast(1)));
+                    try queue.append(bit);
+                }
+            },
+            .output => {
+                var output_byte: u8 = 0;
+
+                for (0..8) |_| {
+                    output_byte >>= 1;
+                    output_byte |= @as(u8, queue.popOrNull() orelse return) << 7;
+                }
+                try stdout.writeByte(output_byte);
+            },
+            .dump_state => {
+                for (queue.items) |bit| {
+                    try stdout.print("{d} ", .{bit});
+                }
+                try stdout.writeByte('\n');
+            },
+            .comment => skipComments(code_reader),
+            else => {
+                return error.UnknownCommand;
             },
         }
     }
-    _ = queue_start;
 }
 
-fn enqueue(queue: *std.bit_set.DynamicBitSet, index: *usize, value: u1, size: *usize) !void {
-    index.* += 1;
+fn returnFromFunction(
+    code_file: std.fs.File,
+    call_stack: *std.ArrayList(FunctionCall),
+) !void {
+    const from: ?FunctionCall = call_stack.popOrNull();
+    const return_address = if (from) |call|
+        call.return_address
+    else
+        try code_file.getEndPos();
 
-    if (index.* == size.*) {
-        size.* += 1024;
-        try queue.*.resize(size.*, false);
-    }
-
-    queue.*.setValue(index.*, value == 1);
+    try code_file.seekTo(return_address);
 }
 
-fn addLevel(levels: []Level, depth: *usize, value: Level, allocator: std.mem.Allocator) !void {
-    depth.* += 1;
-
-    if (depth.* == levels.len) {
-        depth.* += 256;
-        if (allocator.resize(levels, depth.*) == false) return error.ResizeFailed;
-    }
-
-    levels[depth.*] = value;
-}
-
-// TODO
-fn removeLevel(code: []u8, address: *usize, levels: []Level, depth: *usize) ?Level {
-    _ = code;
-    _ = address;
-    _ = levels;
-    _ = depth;
-    return null;
-}
-
-fn traverseCode(
-    code: []u8,
-    address: *usize,
-    old_instruction: Instruction,
-    line: *usize,
-    column: *usize,
-    direction: Direction,
-    comment: *bool,
+//// Caller owns any returned function names in map
+fn parseNamedFunctions(
+    code_file: std.fs.File,
+    named_function_map: *std.StringHashMap(Function),
     allocator: std.mem.Allocator,
-) ?Instruction {
-    if (address.* == code.len) return null;
+) !void {
+    var depth: usize = 0;
+    const code_reader = code_file.reader().any();
+    defer code_file.seekTo(0) catch
+        std.debug.panic("could not reset file position after parsing functions", .{});
 
-    const char = code[address.*];
+    while (readByteNoWhitespace(code_reader)) |byte| {
+        const command: Command = @enumFromInt(byte);
+        switch (command) {
+            .define => {
+                if (depth != 0) return error.FunctionDefinitionInBody;
 
-    var instruction: Instruction = undefined;
-    instruction.identifier = null;
-
-    if (direction == .forward) {
-        if (char == '\n') {
-            column.* = 0; // will be incremented
-            line.* += 1;
-            comment.* = false;
-        } else {
-            column.* += 1;
+                const name = try readFunctionName(code_file, allocator);
+                try named_function_map.put(
+                    name,
+                    try findFunctionBounds(code_file),
+                );
+            },
+            .comment => {
+                skipComments(code_reader);
+            },
+            .start_block => {
+                depth += 1;
+            },
+            .end_block => {
+                if (depth == 0) return error.UnopenedBlock;
+                depth -= 1;
+            },
+            else => {},
         }
-    } // errors should only appear when moving forward because all data before will have already
-    //   been scanned, therefore line and column will not be needed
-
-    if (direction == .forward) {
-        address.* += 1;
-        if (comment.*) {
-            return traverseCode(code, address, old_instruction, line, column, direction, comment, allocator);
-        }
-        if (std.ascii.isAlphabetic(char) or char == '_') {
-            instruction.identifier = parseIdentifier(code, address);
-        } else if (std.ascii.isWhitespace(char)) {
-            return traverseCode(code, address, old_instruction, line, column, direction, comment, allocator);
-        }
-    } else {
-        address.* -|= 1;
     }
+}
+// Caller owns any returned function names in map
+fn parseAnonFunctions(
+    code_file: std.fs.File,
+    anon_function_map: *std.AutoHashMap(usize, Function),
+) !void {
+    var code_reader = code_file.reader();
+    defer code_file.seekTo(0) catch
+        std.debug.panic("could not reset file position after parsing functions", .{});
 
-    if (instruction.identifier == null) {
-        instruction.command = std.meta.intToEnum(Command, char) catch {
-            // error unions cannot be tail-call optimized, which this function needs
-            printError(error.InvalidCharacter, line.*, column.*, char) catch {};
-            return null;
-        };
-    } else {
-        instruction.command = old_instruction.command;
+    while (readByteNoWhitespace(code_reader.any())) |byte| {
+        const command: Command = @enumFromInt(byte);
+        switch (command) {
+            .comment => {
+                skipComments(code_reader.any());
+            },
+            .call_anon => {
+                const start = try code_file.getPos();
+                try anon_function_map.put(
+                    start,
+                    try findFunctionBounds(code_file),
+                );
+                try code_file.seekTo(start);
+            },
+            else => {},
+        }
     }
-
-    return instruction;
 }
 
-fn parseIdentifier(code: []u8, address: *usize) u64 {
-    const begin = address.* - 1;
-    var end = address.*; // slice syntax is non-inclusive on the right side
+fn skipComments(code_reader: std.io.AnyReader) void {
+    while (code_reader.readByte() catch null) |byte| {
+        if (byte == '\n') break;
+    }
+}
 
-    while (address.* < code.len) : (address.* += 1) {
-        if (std.ascii.isAlphanumeric(code[address.*]) or code[address.*] == '_') {
-            end += 1;
-        } else {
-            break;
+fn skipFunctionName(code_file: std.fs.File) !void {
+    const code_reader = code_file.reader();
+
+    if (readByteNoWhitespace(code_reader.any())) |byte| {
+        switch (byte) {
+            'a'...'z',
+            'A'...'Z',
+            '_',
+            => {
+                while (code_reader.readByte() catch null) |inner_byte| {
+                    switch (inner_byte) {
+                        'a'...'z',
+                        'A'...'Z',
+                        '0'...'9',
+                        '_',
+                        => {
+                            continue;
+                        },
+                        else => {
+                            break;
+                        },
+                    }
+                }
+            },
+            else => {},
         }
     }
 
-    // incredibly small chance of collision
-    // TODO: change this to string interning later
-    return std.hash.Murmur3_32.hash(code[begin..end]);
+    try code_file.seekBy(-1);
 }
 
-fn printError(err: anyerror, line: usize, column: usize, char: ?u8) !void {
-    var stderr = std.io.getStdErr();
-    try stderr.writer().print("Error on line: {d}, column: {d}\n", .{ line, column });
+fn readFunctionName(
+    code_file: std.fs.File,
+    allocator: std.mem.Allocator,
+) ![]const u8 {
+    const code_reader = code_file.reader();
+    var name = std.ArrayList(u8).init(allocator);
+    errdefer name.deinit();
 
-    switch (err) {
-        error.InvalidCharacter => try stderr.writer().print("Invalid Character '{c}'\n", .{char.?}),
-        error.UnexpectedIdentifier => try stderr.writer().print("Unexpected Identifier\n", .{}),
-        else => try stderr.writeAll("Unknown Error\n"),
+    if (readByteNoWhitespace(code_reader.any())) |initial_byte| {
+        switch (initial_byte) {
+            'a'...'z',
+            'A'...'Z',
+            '_',
+            => {
+                try name.append(initial_byte);
+
+                while (code_reader.readByte() catch null) |next_byte| {
+                    if (std.ascii.isWhitespace(next_byte)) break;
+                    switch (next_byte) {
+                        'a'...'z',
+                        'A'...'Z',
+                        '0'...'9',
+                        '_',
+                        => try name.append(next_byte),
+                        else => {
+                            try code_file.seekBy(-1);
+                            return name.toOwnedSlice();
+                        },
+                    }
+                } else return error.NoFunctionFollowingName;
+            },
+            else => return error.NoFunctionNameGiven,
+        }
+    } else return error.UnfinishedFunctionName;
+
+    return name.toOwnedSlice();
+}
+
+fn findFunctionBounds(code_file: std.fs.File) !Function {
+    const entry_address = try code_file.getPos();
+    try skipBody(code_file);
+    const exit_address: u64 = try code_file.getPos();
+
+    return Function{
+        .entry = entry_address,
+        .exit = exit_address,
+    };
+}
+
+fn skipBody(code_file: std.fs.File) !void {
+    const code_reader = code_file.reader().any();
+    var depth: usize = 0;
+
+    while (readByteNoWhitespace(code_reader)) |byte| {
+        const command: Command = @enumFromInt(byte);
+        switch (command) {
+            .conditional, .call, .call_anon => continue,
+            .define => return error.FunctionDefinitionInBody,
+            .start_block => depth += 1,
+            .end_block => {
+                if (depth == 0) return error.UnopenedBlock;
+                depth -= 1;
+            },
+            .comment => skipComments(code_reader),
+            else => {
+                switch (byte) {
+                    'A'...'Z',
+                    'a'...'z',
+                    '_',
+                    => {
+                        while (readByteNoWhitespace(code_reader)) |inner_byte| {
+                            switch (inner_byte) {
+                                'A'...'Z',
+                                'a'...'z',
+                                '0'...'9',
+                                '_',
+                                => {},
+                                else => {
+                                    try code_file.seekBy(-1);
+                                    break;
+                                },
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            },
+        }
+        if (depth == 0) break;
     }
+}
 
-    return;
+fn readByteNoWhitespace(reader: std.io.AnyReader) ?u8 {
+    while (reader.readByte() catch null) |byte| {
+        if (std.ascii.isWhitespace(byte)) continue;
+        return byte;
+    } else return null;
+}
+
+fn printUsage(arg0: []const u8, error_message: ?[]const u8) !void {
+    const writer = if (error_message == null)
+        std.io.getStdOut().writer()
+    else
+        std.io.getStdErr().writer();
+
+    try writer.print(
+        \\usage:
+        \\{s} <program file>
+        \\
+    , .{arg0});
+
+    if (error_message) |message| {
+        try writer.print("{s}\n", .{message});
+    }
 }
