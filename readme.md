@@ -62,5 +62,3 @@
 
 - `,` enqueues the inputted bits such that the high-order bit is enqueued
   first. For example, `,.` will output the same byte that was inputted.
-
-- Every `(` must have a matching `)` and vice versa.
