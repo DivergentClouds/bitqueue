@@ -1,0 +1,98 @@
+; data format:
+;   each data bit is prefixed with a single metadata bit
+;   a metadata bit of 1 marks the front of the queue
+;   all other metadata bits should be 0
+;
+
+:move(
+  ?(
+    1 <
+  )(
+    0
+  )
+)
+
+; cycle to the front of the queue
+; uses the described data format
+; consumes start-of queue bit
+; doesn't work if first bit is not metadata
+:cycle(
+  ; if metadata is start of queue, return
+  ?<
+
+  ; otherwise, re-enqueue metadata
+  0
+
+  ; move data
+  >move
+
+  ; loop
+  '^
+)
+
+:bct0(
+  >cycle
+
+  ; delete data bit
+  ?()
+
+  ; mark next metadata bit as front of queue
+  ?() 1
+
+  ; make the first bit metadata
+  >move
+)
+
+:bct10(
+  >cycle
+
+  ?(
+    ; enqueue 0
+    0 0
+
+    ; re-enqueue metadata
+    1
+    ; re-enqueue data
+    1
+    <
+  )(
+    ; re-enqueue metadata
+    1
+
+    ; re-enqueue data
+    0
+  )
+)
+
+:bct11(
+  >cycle
+
+  ?(
+    ; enqueue 1
+    0 1
+
+    ; re-enqueue metadata
+    1
+    ; re-enqueue data
+    1
+
+    <
+  )(
+    ; re-enqueue metadata
+    1
+
+    ; re-enqueue data
+    0
+  )
+)
+
+
+; initial data
+; 1 0 0 1 0
+11 00 00 01 00
+
+'(
+  ; program here
+
+  '^
+)
