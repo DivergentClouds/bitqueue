@@ -92,8 +92,9 @@ fn interpret(code_file: std.fs.File, backing_allocator: std.mem.Allocator) !void
 
         if (call_stack.getLastOrNull()) |current_function| {
             const exit_address = current_function.function.exit;
-            if (try code_file.getPos() >= exit_address) {
+            if (try code_file.getPos() > exit_address) {
                 try returnFromFunction(code_file, &call_stack);
+                continue;
             }
         }
 
